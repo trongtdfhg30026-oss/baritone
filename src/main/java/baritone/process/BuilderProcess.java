@@ -36,12 +36,14 @@ import baritone.pathing.movement.MovementHelper;
 import baritone.utils.BaritoneProcessHelper;
 import baritone.utils.BlockStateInterface;
 import baritone.utils.PathingCommandContext;
+import baritone.utils.ToolSet;
 import baritone.utils.schematic.MapArtSchematic;
 import baritone.utils.schematic.SchematicSystem;
 import baritone.utils.schematic.SelectionSchematic;
 import baritone.utils.schematic.litematica.LitematicaHelper;
 import baritone.utils.schematic.schematica.SchematicaHelper;
 import com.google.common.collect.ImmutableSet;
+import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
 import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
@@ -91,6 +93,53 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
     private int numRepeats;
     private List<BlockState> approxPlaceable;
     public int stopAtHeight = 0;
+
+    // --- Source Water via Ice (see Settings#buildFillSourceWaterWithIce) ---
+    private enum IceWaterPhase {
+        PLACE_ICE, WAIT_AFTER_PLACE, BREAK_ICE, WAIT_AFTER_BREAK
+    }
+
+    private static final class IceWaterTask {
+        IceWaterPhase phase = IceWaterPhase.PLACE_ICE;
+        long readyAtTick = 0;
+        int cycles = 0;
+        // guards against the state machine being advanced more than once per real game tick, since
+        // getSchematic() can be (and is) called many times per tick: once from recalcNearby, once from
+        // toBreakNearPlayer, once from searchForPlacables, once from assemble(), and potentially dozens/hundreds
+        // of times from costOfPlacingAt/breakCostMultiplierAt during a single A* search.
+        long lastTickSeen = -1;
+    }
+
+    private final Long2ObjectOpenHashMap<IceWaterTask> iceWaterTasks = new Long2ObjectOpenHashMap<>();
+    private final LongOpenHashSet warnedNoSupportForSourceWater = new LongOpenHashSet();
+    private long tickCounter = 0;
+
+    private static boolean isSourceWater(BlockState state) {
+        return state.getBlock() == Blocks.WATER && state.getValue(LiquidBlock.LEVEL) == 0;
+    }
+
+    /**
+     * Best-effort check for vanilla's real requirement (confirmed against the current Minecraft Wiki description
+     * of Ice, not assumed): breaking Ice only turns it into a water source if there is a movement-blocking block
+     * or any fluid directly underneath. This is a pre-check to avoid futile place/break cycles when the position
+     * below can never support the conversion (e.g. still air because it hasn't been built yet, or a hole) - it is
+     * intentionally conservative (uses collision shape as a proxy for "blocks motion") since the real decision is
+     * always made server-side by the game itself when the block is actually broken.
+     */
+    private boolean hasSupportForSourceWaterConversion(int x, int y, int z) {
+        BlockPos below = new BlockPos(x, y - 1, z);
+        BlockState belowState = ctx.world().getBlockState(below);
+        if (!belowState.getFluidState().isEmpty()) {
+            return true;
+        }
+        return !belowState.getCollisionShape(ctx.world(), below).isEmpty();
+    }
+
+    private boolean isBreakingIceForSourceWater(BlockPos pos) {
+        IceWaterTask task = iceWaterTasks.get(BetterBlockPos.longHash(pos.getX(), pos.getY(), pos.getZ()));
+        return task != null && task.phase == IceWaterPhase.BREAK_ICE;
+    }
+    // --- end Source Water via Ice ---
 
     public BuilderProcess(Baritone baritone) {
         super(baritone);
@@ -156,6 +205,7 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
         this.numRepeats = 0;
         this.observedCompleted = new LongOpenHashSet();
         this.incorrectPositions = null;
+        this.iceWaterTasks.clear();
     }
 
     public void resume() {
@@ -442,6 +492,10 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
         if (recursions > 100) { // onTick calls itself, don't crash
             return new PathingCommand(null, PathingCommandType.SET_GOAL_AND_PATH);
         }
+        if (recursions == 0) {
+            // only advance the clock once per real game tick, not on every internal re-entrant call
+            tickCounter++;
+        }
         approxPlaceable = approxPlaceable(36);
         if (baritone.getInputOverrideHandler().isInputForcedDown(Input.CLICK_LEFT)) {
             ticks = 5;
@@ -520,6 +574,7 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
             }
             // build repeat time
             layer = 0;
+            iceWaterTasks.clear(); // origin is moving, any in-progress ice/water positions are for the old origin
             origin = new BlockPos(origin).offset(repeat);
             if (!Baritone.settings().buildRepeatSneaky.value) {
                 schematic.reset();
@@ -538,7 +593,15 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
             Rotation rot = toBreak.get().getB();
             BetterBlockPos pos = toBreak.get().getA();
             baritone.getLookBehavior().updateTarget(rot, true);
-            MovementHelper.switchToBestToolFor(ctx, bcc.get(pos));
+            if (isBreakingIceForSourceWater(pos)) {
+                // never select a Silk Touch tool for this specific block: Silk Touch would just pick up the Ice
+                // item instead of letting it convert to water, silently breaking the whole trick. This only
+                // overrides tool choice for this one in-progress ice-water position, regardless of the user's
+                // global preferSilkTouch setting - breaking every other block is completely unaffected.
+                MovementHelper.switchToBestToolFor(ctx, bcc.get(pos), new ToolSet(ctx.player()), false);
+            } else {
+                MovementHelper.switchToBestToolFor(ctx, bcc.get(pos));
+            }
             if (ctx.player().isCrouching()) {
                 // really horrible bug where a block is visible for breaking while sneaking but not otherwise
                 // so you can't see it, it goes to place something else, sneaks, then the next tick it tries to break
@@ -1028,9 +1091,95 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
         return result;
     }
 
+    /**
+     * Drives the place-Ice / wait / break-Ice / wait / verify state machine for one source-water position.
+     * Called only when the schematic wants source water at (x,y,z) and it isn't source water yet.
+     * <p>
+     * IMPORTANT: this can be called many times in a single game tick (recalcNearby, toBreakNearPlayer,
+     * searchForPlacables, assemble, and A* cost queries all call getSchematic for the same position). Only the
+     * FIRST call in a given tick is allowed to actually advance the state machine (see IceWaterTask#lastTickSeen);
+     * every subsequent call this same tick just reports the already-decided phase, so nothing here can advance
+     * twice, spawn duplicate tasks, or double-count a retry cycle within one tick.
+     */
+    private BlockState resolveSourceWater(long key, BlockState current, BlockState desiredWater) {
+        IceWaterTask task = iceWaterTasks.get(key);
+        if (task == null) {
+            task = new IceWaterTask();
+            iceWaterTasks.put(key, task);
+        }
+        if (task.lastTickSeen != tickCounter) {
+            task.lastTickSeen = tickCounter;
+            advanceIceWaterTask(task, current);
+        }
+        switch (task.phase) {
+            case PLACE_ICE:
+            case WAIT_AFTER_PLACE:
+                return Blocks.ICE.defaultBlockState();
+            case BREAK_ICE:
+            case WAIT_AFTER_BREAK:
+            default:
+                return desiredWater;
+        }
+    }
+
+    /**
+     * The actual state transition logic. Only ever invoked (at most) once per real game tick per position,
+     * from {@link #resolveSourceWater}.
+     */
+    private void advanceIceWaterTask(IceWaterTask task, BlockState current) {
+        switch (task.phase) {
+            case PLACE_ICE: {
+                if (current.getBlock() == Blocks.ICE) {
+                    task.phase = IceWaterPhase.WAIT_AFTER_PLACE;
+                    task.readyAtTick = tickCounter + Baritone.settings().sourceWaterIceWaitTicks.value;
+                }
+                break;
+            }
+            case WAIT_AFTER_PLACE: {
+                if (current.getBlock() != Blocks.ICE) {
+                    // our ice got removed/never actually placed (griefed, misclick, etc) - ask for it again
+                    task.phase = IceWaterPhase.PLACE_ICE;
+                } else if (tickCounter >= task.readyAtTick) {
+                    task.phase = IceWaterPhase.BREAK_ICE;
+                }
+                break;
+            }
+            case BREAK_ICE: {
+                if (current.getBlock() != Blocks.ICE) {
+                    // it's been mined (by our own action from a previous tick finally applying) - verify next
+                    task.phase = IceWaterPhase.WAIT_AFTER_BREAK;
+                    task.readyAtTick = tickCounter + Baritone.settings().sourceWaterIceWaitTicks.value;
+                }
+                break;
+            }
+            case WAIT_AFTER_BREAK:
+            default: {
+                if (tickCounter >= task.readyAtTick) {
+                    // isSourceWater(current) is already checked by the caller (getSchematic) before this method
+                    // is ever reached, so if we get here, current is still not source water - timed out
+                    task.cycles++;
+                    if (task.cycles >= Baritone.settings().sourceWaterMaxCycles.value) {
+                        // give up retrying for a while instead of spamming place/break forever on a position
+                        // that may never be able to hold water (bad dimension, obstruction, etc); just keep
+                        // quietly re-checking occasionally in case conditions change
+                        task.readyAtTick = tickCounter + Baritone.settings().sourceWaterIceWaitTicks.value * 8L;
+                    } else {
+                        task.phase = IceWaterPhase.PLACE_ICE;
+                    }
+                }
+                break;
+            }
+        }
+    }
+
     private static boolean sameBlockstate(BlockState first, BlockState second) {
         if (first.getBlock() != second.getBlock()) {
             return false;
+        }
+        if (Baritone.settings().buildIgnoreAllProperties.value.contains(first.getBlock())) {
+            // block type already matches (checked above) and this block is configured to skip property
+            // comparison entirely (see Settings#buildIgnoreAllProperties) - accept whatever state it's in
+            return true;
         }
         boolean ignoreDirection = Baritone.settings().buildIgnoreDirection.value;
         List<String> ignoredProps = Baritone.settings().buildIgnoreProperties.value;
@@ -1108,7 +1257,33 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
 
         private BlockState getSchematic(int x, int y, int z, BlockState current) {
             if (schematic.inSchematic(x - originX, y - originY, z - originZ, current)) {
-                return schematic.desiredState(x - originX, y - originY, z - originZ, current, BuilderProcess.this.approxPlaceable);
+                BlockState desired = schematic.desiredState(x - originX, y - originY, z - originZ, current, BuilderProcess.this.approxPlaceable);
+                if (isSourceWater(desired)) {
+                    long key = BetterBlockPos.longHash(x, y, z);
+                    if (isSourceWater(current)) {
+                        // already correct - drop any leftover in-progress task for this position
+                        iceWaterTasks.remove(key);
+                        return desired;
+                    }
+                    if (Baritone.settings().buildFillSourceWaterWithIce.value) {
+                        if (!hasSupportForSourceWaterConversion(x, y, z)) {
+                            // per vanilla Ice's actual behavior, breaking it here would just vanish, not become
+                            // water (nothing solid/liquid underneath yet - likely a lower layer not built yet).
+                            // Don't even start the ice cycle; fall through to reporting plain "desired water"
+                            // (shows up as ordinary "missing materials" - no place/break spam) and warn once.
+                            iceWaterTasks.remove(key);
+                            if (warnedNoSupportForSourceWater.add(key)) {
+                                logDirect(String.format(
+                                        "Skipping ice->water trick at %s,%s,%s: nothing solid/liquid underneath yet",
+                                        x, y, z
+                                ));
+                            }
+                            return desired;
+                        }
+                        return resolveSourceWater(key, current, desired);
+                    }
+                }
+                return desired;
             } else {
                 return null;
             }
@@ -1127,7 +1302,7 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
                     // this won't be a schematic block, this will be a throwaway
                     return placeBlockCost * Baritone.settings().placeIncorrectBlockPenaltyMultiplier.value; // we're going to have to break it eventually
                 }
-                if (placeable.contains(sch)) {
+                if (containsBlockState(placeable, sch)) {
                     return 0; // thats right we gonna make it FREE to place a block where it should go in a structure
                     // no place block penalty at all 😎
                     // i'm such an idiot that i just tried to copy and paste the epic gamer moment emoji too

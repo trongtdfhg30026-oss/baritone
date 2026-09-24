@@ -332,6 +332,50 @@ public final class Settings {
     )));
 
     /**
+     * A list of blocks for which the builder will accept ANY BlockState as correct, as long as the base Block
+     * matches the schematic. No individual property (facing, powered, extended, age, leaves, etc) is compared.
+     * <p>
+     * This is intended for two situations:
+     * <p>
+     * 1. Blocks whose state is entirely dictated by the game after placement and isn't meaningful to try to
+     * match exactly (e.g. {@code minecraft:bamboo}, whose age/leaves state depends on growth stage).
+     * <p>
+     * 2. Redstone-adjacent blocks (observers, pistons, sticky pistons, dispensers, droppers, and similar) where
+     * you only care that the correct block is present, not its exact facing/powered/extended/triggered state.
+     * Add the relevant blocks here (e.g. {@code observer,piston,sticky_piston,dispenser,dropper}) to get that
+     * behavior; it is intentionally opt-in and not hardcoded to any specific block list here.
+     */
+    public final Setting<List<Block>> buildIgnoreAllProperties = new Setting<>(new ArrayList<>(Arrays.asList(
+            Blocks.BAMBOO
+    )));
+
+    /**
+     * When a schematic requires a source water block (fluid level 0) and Baritone can't place it directly
+     * (Baritone's placement logic only supports {@link net.minecraft.world.item.BlockItem}s, so a water bucket,
+     * being a {@link net.minecraft.world.item.BucketItem}, is never selected as a placement item), fake it by
+     * placing an Ice block on top of the target and then mining it: in the Overworld, breaking Ice without
+     * Silk Touch converts it into a water source in vanilla Minecraft.
+     * <p>
+     * This only ever triggers for source water (fluid level 0). Flowing water and other fluid levels are left
+     * completely alone.
+     */
+    public final Setting<Boolean> buildFillSourceWaterWithIce = new Setting<>(true);
+
+    /**
+     * How many ticks to wait after placing Ice (for {@link #buildFillSourceWaterWithIce}) before mining it, and
+     * again after mining it before checking whether it turned into water. Gives the server time to sync the
+     * block update instead of Baritone re-checking (and potentially re-acting) every single tick.
+     */
+    public final Setting<Integer> sourceWaterIceWaitTicks = new Setting<>(10);
+
+    /**
+     * How many place-ice/break-ice cycles {@link #buildFillSourceWaterWithIce} will attempt at a single position
+     * before backing off and only rechecking occasionally, so a position that can never hold water (e.g. bad
+     * dimension, obstruction) doesn't get spammed with place/break forever.
+     */
+    public final Setting<Integer> sourceWaterMaxCycles = new Setting<>(5);
+
+    /**
      * If this setting is true, Baritone will never break a block that is adjacent to an unsupported falling block.
      * <p>
      * I.E. it will never trigger cascading sand / gravel falls
